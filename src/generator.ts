@@ -1,5 +1,5 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { dirname, extname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { dirname, posix, win32 } from 'node:path';
 
 import { httpMethods, type UppercaseHTTPMethod } from './http.ts';
 
@@ -236,12 +236,17 @@ function resolveHandlerImport(
     return handler;
   }
 
-  const absoluteHandler = isAbsolute(handler) ? handler : resolve(projectRoot, handler);
-  const extension = extname(absoluteHandler);
+  const path = [declarationFile, projectRoot, handler].some(value => win32.isAbsolute(value))
+    ? win32
+    : posix;
+  const absoluteHandler = path.isAbsolute(handler) ? handler : path.resolve(projectRoot, handler);
+  const extension = path.extname(absoluteHandler);
   const pathWithoutExtension = routeFileExtensions.has(extension)
     ? absoluteHandler.slice(0, -extension.length)
     : absoluteHandler;
-  const importPath = toPosixPath(relative(dirname(declarationFile), pathWithoutExtension));
+  const importPath = toPosixPath(
+    path.relative(path.dirname(declarationFile), pathWithoutExtension),
+  );
 
   return importPath.startsWith('.') ? importPath : `./${importPath}`;
 }
@@ -311,5 +316,5 @@ function indent(depth: number): string {
 }
 
 function toPosixPath(path: string): string {
-  return path.split(sep).join('/');
+  return path.replaceAll('\\', '/');
 }
