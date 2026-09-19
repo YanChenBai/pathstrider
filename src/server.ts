@@ -1,5 +1,6 @@
 import type { StandardSchemaV1 } from '@standard-schema/spec';
 import { defineHandler, HTTPError, type EventHandlerWithFetch, type H3Event } from 'nitro';
+import { useRuntimeConfig } from 'nitro/runtime-config';
 
 import {
   errorResponseHeader,
@@ -214,7 +215,7 @@ export function defineTypedHandler<
 
       const responseSchema = getResponseSchema(schemas?.response, statusCode);
 
-      if (!responseSchema) {
+      if (!responseSchema || !shouldValidateResponse()) {
         return value;
       }
 
@@ -311,6 +312,10 @@ function isStandardSchema(value: ResponseSchemas): value is StandardSchemaV1 {
 
 function isStatusResponse(value: unknown): value is StatusResponse {
   return Boolean(value && typeof value === 'object' && statusResponse in value);
+}
+
+function shouldValidateResponse(): boolean {
+  return useRuntimeConfig().pathstrider?.validation?.response === true;
 }
 
 function normalizeHTTPError(error: HTTPError): ErrorShape {

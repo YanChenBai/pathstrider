@@ -32,6 +32,9 @@ test('Nitro integration generates types from its resolved routing table', async 
     output: {
       types: './types/pathstrider.d.ts',
     },
+    validation: {
+      response: true,
+    },
   });
   const nitro = await createNitro({
     modules: [plugin.nitro],
@@ -53,6 +56,11 @@ test('Nitro integration generates types from its resolved routing table', async 
     expect(nitro.options.errorHandler).toEqual(
       expect.arrayContaining([expect.stringMatching(/pathstrider\/src\/error-handler\.ts$/)]),
     );
+    expect(nitro.options.runtimeConfig.pathstrider).toEqual({
+      validation: {
+        response: true,
+      },
+    });
 
     await build(nitro);
 

@@ -1,4 +1,5 @@
 import type { StandardSchemaV1 } from '@standard-schema/spec';
+import { useRuntimeConfig } from 'nitro/runtime-config';
 import { describe, expect, expectTypeOf, test, vi } from 'vite-plus/test';
 
 import type { PathstriderError, ValidationError } from '../src/error.ts';
@@ -31,7 +32,7 @@ const querySchema = schema<unknown, { id: string; tags: string[] }>(value => {
 });
 
 describe('defineTypedHandler', () => {
-  test('validates request schemas and the shorthand 200 response schema', async () => {
+  test('validates request schemas with a shorthand 200 response schema', async () => {
     const handler = defineTypedHandler(
       ({ body, headers, query }) => ({
         id: query.id,
@@ -154,7 +155,21 @@ describe('defineTypedHandler', () => {
     >();
   });
 
-  test('validates successful status mapped responses', async () => {
+  test('does not validate successful responses by default', async () => {
+    const validate = vi.fn(() => ({
+      value: { id: 'transformed' },
+    }));
+    const handler = defineTypedHandler(() => ({ id: 'user-1' }), {
+      response: schema<unknown, { id: string }>(validate),
+    });
+
+    const response = await handler.fetch('https://example.test/api/users');
+
+    expect(validate).not.toHaveBeenCalled();
+    await expect(response.json()).resolves.toEqual({ id: 'user-1' });
+  });
+
+  test('validates successful responses when globally enabled', async () => {
     const validate = vi.fn((value: unknown) => ({
       value: { ...(value as { id: string }), transformed: true },
     }));
@@ -164,32 +179,61 @@ describe('defineTypedHandler', () => {
       },
     });
 
+    const runtimeConfig = useRuntimeConfig();
+    const currentConfig = runtimeConfig.pathstrider;
+
+    runtimeConfig.pathstrider = {
+      validation: {
+        response: true,
+      },
+    };
+
     const response = await handler.fetch('https://example.test/api/users');
+
+    runtimeConfig.pathstrider = currentConfig;
 
     expect(response.status).toBe(201);
     expect(validate).toHaveBeenCalledOnce();
     await expect(response.json()).resolves.toEqual({ id: 'user-1', transformed: true });
   });
 
-  test('turns invalid error values and response validation failures into internal errors', async () => {
+  test('turns invalid error values into internal errors', async () => {
     const invalidErrorHandler = defineTypedHandler(({ status }) =>
       status(404, {
         code: 'BROKEN',
       } as never),
     );
-    const invalidResponseHandler = defineTypedHandler(() => ({ ok: true }), {
+    const response = await invalidErrorHandler.fetch('https://example.test/api/test');
+
+    expect(response.status).toBe(500);
+    await expect(response.json()).resolves.toEqual({
+      code: 'INTERNAL_SERVER_ERROR',
+      message: 'Internal server error',
+    });
+  });
+
+  test('turns enabled response validation failures into internal errors', async () => {
+    const handler = defineTypedHandler(() => ({ ok: true }), {
       response: schema(() => ({ issues: [{ message: 'Invalid response.' }] })),
     });
+    const runtimeConfig = useRuntimeConfig();
+    const currentConfig = runtimeConfig.pathstrider;
 
-    for (const handler of [invalidErrorHandler, invalidResponseHandler]) {
-      const response = await handler.fetch('https://example.test/api/test');
+    runtimeConfig.pathstrider = {
+      validation: {
+        response: true,
+      },
+    };
 
-      expect(response.status).toBe(500);
-      await expect(response.json()).resolves.toEqual({
-        code: 'INTERNAL_SERVER_ERROR',
-        message: 'Internal server error',
-      });
-    }
+    const response = await handler.fetch('https://example.test/api/test');
+
+    runtimeConfig.pathstrider = currentConfig;
+
+    expect(response.status).toBe(500);
+    await expect(response.json()).resolves.toEqual({
+      code: 'INTERNAL_SERVER_ERROR',
+      message: 'Internal server error',
+    });
   });
 
   test('passes undefined to an optional body schema when the request has no body', async () => {

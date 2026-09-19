@@ -12,6 +12,10 @@ export interface PathstriderOptions {
     types?: string | false;
   };
   scan?: RouteFilterOptions;
+  validation?: {
+    /** @default false */
+    response?: boolean;
+  };
 }
 
 export function pathstrider(options: PathstriderOptions = {}): Plugin & { nitro: NitroModule } {
@@ -22,6 +26,7 @@ export function pathstrider(options: PathstriderOptions = {}): Plugin & { nitro:
       name: 'pathstrider',
       setup(nitro) {
         registerErrorHandler(nitro);
+        registerRuntimeConfig(nitro, options);
 
         nitro.hooks.hook('build:before', async () => {
           if (options.output?.types === false) {
@@ -41,6 +46,18 @@ export function pathstrider(options: PathstriderOptions = {}): Plugin & { nitro:
           });
         });
       },
+    },
+  };
+}
+
+function registerRuntimeConfig(nitro: Nitro, options: PathstriderOptions): void {
+  const current = nitro.options.runtimeConfig.pathstrider ?? {};
+
+  nitro.options.runtimeConfig.pathstrider = {
+    ...current,
+    validation: {
+      ...current.validation,
+      response: options.validation?.response ?? false,
     },
   };
 }

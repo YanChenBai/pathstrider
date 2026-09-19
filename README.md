@@ -62,6 +62,9 @@ export default defineConfig({
         include: ['/api/**'],
         exclude: ['/api/internal/**'],
       },
+      validation: {
+        response: true,
+      },
     }),
   ],
 });
@@ -142,8 +145,10 @@ defineTypedHandler(handler, {
 });
 ```
 
-Successful responses are validated at runtime. Non-success response schemas currently provide
-input and client inference only; Pathstrider still verifies their common error shape at runtime.
+Response schemas provide client inference. Runtime response validation is disabled by default;
+enable it globally with `validation.response`. When enabled, successful response schemas can also
+transform their values. Non-success response schemas currently provide input and client inference
+only, while Pathstrider always verifies their common error shape at runtime.
 
 ## One Error Shape
 
