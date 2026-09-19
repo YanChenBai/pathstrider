@@ -1,6 +1,6 @@
 {
   "name": "pathstrider",
-  "version": "0.0.0",
+  "version": "0.0.1",
   "description": "Configurable end-to-end type-safe routing for Nitro, powered by Standard Schema and Ky.",
   "keywords": [
     "end-to-end-types",
