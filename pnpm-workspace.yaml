@@ -8,3 +8,5 @@ peerDependencyRules:
     - vite
   allowedVersions:
     vite: '*'
+minimumReleaseAgeExclude:
+  - vite@8.3.4

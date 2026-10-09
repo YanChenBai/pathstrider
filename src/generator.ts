@@ -1,9 +1,14 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { dirname, posix, win32 } from 'node:path';
+import { dirname, isAbsolute, relative } from 'node:path';
 
-import { httpMethods, type UppercaseHTTPMethod } from './http.ts';
+import { compileRoutes } from 'fetchdts/compiler';
+import type { Route } from 'fetchdts/compiler';
+import { createJiti } from 'jiti';
+import { routeNodeKeys } from 'rou3';
 
-const routeFileExtensions = new Set(['.js', '.jsx', '.mjs', '.mts', '.ts', '.tsx']);
+import { extractContract } from './extract.ts';
+import { generateOpenAPI } from './openapi.ts';
+import type { RouteContract } from './server.ts';
 
 export interface ResolvedRoute {
   handler: string;
@@ -11,310 +16,94 @@ export interface ResolvedRoute {
   route: string;
 }
 
-export interface RouteFilterOptions {
-  exclude?: string[];
-  include?: string[];
-  methods?: UppercaseHTTPMethod[];
-}
-
-interface RouteEntry {
-  fallback: boolean;
-  file: string;
-  method: UppercaseHTTPMethod;
-  route: string;
-}
-
-interface DynamicRoute {
-  catchAll: boolean;
-  name: string;
-  node: RouteNode;
-}
-
-interface RouteNode {
-  children: Map<string, RouteNode>;
-  dynamic?: DynamicRoute;
-  methods: Map<UppercaseHTTPMethod, Pick<RouteEntry, 'fallback' | 'file'>>;
-}
-
 export interface GenerateDeclarationOptions {
-  clientBaseURL: string;
-  declarationFile: string;
-  filter?: RouteFilterOptions;
-  projectRoot: string;
+  dts: string;
   routes: ResolvedRoute[];
+  aliases?: Record<string, string>;
+}
+
+export async function evaluateContract(
+  source: string,
+  filename: string,
+  aliases: Record<string, string> = {},
+): Promise<RouteContract> {
+  const jiti = createJiti(filename, { moduleCache: false, fsCache: false, alias: aliases });
+  const evaluated = await jiti.evalModule(source, { filename, async: true });
+  if (!evaluated || typeof evaluated !== 'object' || !('default' in evaluated)) {
+    throw new Error(`${filename}: failed to evaluate route contract`);
+  }
+  return evaluated.default as RouteContract;
 }
 
 export async function generateDeclaration(options: GenerateDeclarationOptions): Promise<boolean> {
-  const routes = createRouteEntries(options);
-  const source = renderDeclaration(options.declarationFile, options.projectRoot, routes);
-  const currentSource = await readFile(options.declarationFile, 'utf8').catch(() => '');
-
-  if (currentSource === source) {
-    return false;
+  const routes: Route[] = [];
+  const imports = ["import type { OptionalRequestOf, ResponseOf } from 'pathstrider';"];
+  let index = 0;
+  for (const handler of options.routes) {
+    const file = await readHandler(handler.handler);
+    const source = file && extractContract(file.code, file.filename);
+    const metadata: Record<string, string> = {};
+    if (source) {
+      const contract = await evaluateContract(source, file!.filename, options.aliases);
+      await generateOpenAPI(contract);
+      const name = `Handler${index++}`;
+      imports.push(
+        `import type ${name} from ${JSON.stringify(importPath(options.dts, file!.filename))};`,
+      );
+      for (const field of ['query', 'body', 'headers'] as const) {
+        if (contract.validate?.[field])
+          metadata[`${field}Type`] = `OptionalRequestOf<typeof ${name}, '${field}'>`;
+      }
+      if (contract.responses && Object.keys(contract.responses).length) {
+        metadata.responseType = `ResponseOf<typeof ${name}>`;
+      }
+    }
+    for (const key of routeNodeKeys(handler.route)) {
+      routes.push({
+        segments: key
+          .split('/')
+          .slice(1)
+          .map(segment => {
+            if (segment === '*') return { type: 'dynamic' as const };
+            if (segment === '**') return { type: 'wildcard' as const };
+            return segment.replace(/\\(.)/g, '$1');
+          }),
+        metadata: { [handler.method?.toUpperCase() ?? 'ALL']: metadata },
+      });
+    }
   }
-
-  await mkdir(dirname(options.declarationFile), { recursive: true });
-  await writeFile(options.declarationFile, source, 'utf8');
-
+  const compiled = compileRoutes([{ routes }], {
+    name: 'ServerRoutes',
+    imports,
+    moduleSpecifier: 'pathstrider/client',
+  });
+  const source = `${compiled.code}\n\ndeclare module 'pathstrider/client' {\n  interface Routes extends ServerRoutes {}\n}\n`;
+  const current = await readFile(options.dts, 'utf8').catch(() => '');
+  if (current === source) return false;
+  await mkdir(dirname(options.dts), { recursive: true });
+  await writeFile(options.dts, source, 'utf8');
   return true;
 }
 
-export function createRouteEntries(options: GenerateDeclarationOptions): RouteEntry[] {
-  const routePrefix = getBasePathname(options.clientBaseURL);
-  const defaultInclude = routePrefix === '/' ? ['/**'] : [routePrefix, `${routePrefix}/**`];
-  const include = options.filter?.include ?? defaultInclude;
-  const exclude = options.filter?.exclude ?? [];
-  const allowedMethods = new Set(options.filter?.methods ?? []);
-
-  return options.routes.flatMap(route => {
-    if (!matchesAny(route.route, include) || matchesAny(route.route, exclude)) {
-      return [];
-    }
-
-    const methods = route.method
-      ? [normalizeMethod(route.method)]
-      : httpMethods.map(method => method.toUpperCase() as UppercaseHTTPMethod);
-
-    return methods
-      .filter(method => allowedMethods.size === 0 || allowedMethods.has(method))
-      .map(method => ({
-        fallback: !route.method,
-        file: route.handler,
-        method,
-        route: stripRoutePrefix(route.route, routePrefix),
-      }));
-  });
+function importPath(from: string, to: string): string {
+  const path = relative(dirname(from), to)
+    .replaceAll('\\', '/')
+    .replace(/\.mts$/, '.mjs')
+    .replace(/\.cts$/, '.cjs')
+    .replace(/\.tsx?$/, '.js');
+  return path.startsWith('.') ? path : `./${path}`;
 }
 
-export function renderDeclaration(
-  declarationFile: string,
-  projectRoot: string,
-  routes: RouteEntry[],
-): string {
-  const tree = createRouteTree(routes);
-
-  return [
-    '/* eslint-disable */',
-    '/* prettier-ignore */',
-    '// oxfmt-ignore',
-    '// @ts-nocheck',
-    '// Generated by Pathstrider. Do not edit.',
-    '',
-    "import type { ClientMethod, InferHandlerErrors, InferHandlerRequest, InferHandlerResponse } from 'pathstrider/client';",
-    '',
-    "type Route<Handler, Method extends import('pathstrider/client').UppercaseHTTPMethod> = ClientMethod<",
-    '  InferHandlerRequest<Handler>,',
-    '  InferHandlerResponse<Handler>,',
-    '  Method,',
-    '  InferHandlerErrors<Handler>',
-    '>;',
-    '',
-    "declare module 'pathstrider/routes' {",
-    '  interface AppRoutes {',
-    ...renderNodeContents(tree, 2, declarationFile, projectRoot),
-    '  }',
-    '}',
-    '',
-    'export {};',
-    '',
-  ].join('\n');
-}
-
-function createRouteTree(routes: RouteEntry[]): RouteNode {
-  const root = createRouteNode();
-
-  for (const route of routes) {
-    const segments = route.route.split('/').filter(Boolean);
-    let node = root;
-
-    for (const segment of segments) {
-      const isCatchAll = segment === '**' || segment.startsWith('**:');
-      const isDynamic = isCatchAll || segment.startsWith(':');
-
-      if (isDynamic) {
-        const name = segment === '**' ? '_' : segment.slice(isCatchAll ? 3 : 1);
-
-        if (node.dynamic) {
-          const hasConflict = node.dynamic.name !== name || node.dynamic.catchAll !== isCatchAll;
-
-          if (hasConflict) {
-            throw new Error(`Conflicting dynamic routes: "${node.dynamic.name}" and "${name}".`);
-          }
-        } else {
-          node.dynamic = {
-            catchAll: isCatchAll,
-            name,
-            node: createRouteNode(),
-          };
-        }
-
-        node = node.dynamic.node;
-        continue;
-      }
-
-      let child = node.children.get(segment);
-
-      if (!child) {
-        child = createRouteNode();
-        node.children.set(segment, child);
-      }
-
-      node = child;
-    }
-
-    const currentRoute = node.methods.get(route.method);
-
-    if (!currentRoute || (currentRoute.fallback && !route.fallback)) {
-      node.methods.set(route.method, route);
-      continue;
-    }
-
-    if (!currentRoute.fallback && route.fallback) {
-      continue;
-    }
-
-    if (currentRoute.file !== route.file) {
-      throw new Error(`Duplicate route: ${route.method} ${route.route}.`);
+async function readHandler(
+  filename: string,
+): Promise<{ filename: string; code: string } | undefined> {
+  if (!isAbsolute(filename)) return;
+  for (const extension of ['', '.mjs', '.js', '.ts', '.mts', '.tsx', '.jsx']) {
+    const path = filename + extension;
+    try {
+      return { filename: path, code: await readFile(path, 'utf8') };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
   }
-
-  return root;
-}
-
-function createRouteNode(): RouteNode {
-  return {
-    children: new Map(),
-    methods: new Map(),
-  };
-}
-
-function renderNodeContents(
-  node: RouteNode,
-  depth: number,
-  declarationFile: string,
-  projectRoot: string,
-): string[] {
-  const lines: string[] = [];
-
-  if (node.dynamic) {
-    const parameterType = node.dynamic.catchAll ? 'string | string[]' : 'string';
-
-    lines.push(
-      `${indent(depth)}(params: { ${quoteProperty(node.dynamic.name)}: ${parameterType} }): {`,
-    );
-    lines.push(...renderNodeContents(node.dynamic.node, depth + 1, declarationFile, projectRoot));
-    lines.push(`${indent(depth)}};`);
-  }
-
-  const methods = [...node.methods].sort(([left], [right]) => left.localeCompare(right));
-
-  for (const [method, route] of methods) {
-    const importPath = resolveHandlerImport(declarationFile, projectRoot, route.file);
-
-    lines.push(
-      `${indent(depth)}${method.toLowerCase()}: Route<typeof import(${JSON.stringify(importPath)}).default, '${method}'>;`,
-    );
-  }
-
-  const children = [...node.children].sort(([left], [right]) => left.localeCompare(right));
-
-  for (const [segment, child] of children) {
-    lines.push(`${indent(depth)}${quoteProperty(segment)}: {`);
-    lines.push(...renderNodeContents(child, depth + 1, declarationFile, projectRoot));
-    lines.push(`${indent(depth)}};`);
-  }
-
-  return lines;
-}
-
-function resolveHandlerImport(
-  declarationFile: string,
-  projectRoot: string,
-  handler: string,
-): string {
-  if (handler.startsWith('#') || handler.startsWith('\0')) {
-    return handler;
-  }
-
-  const path = [declarationFile, projectRoot, handler].some(value => win32.isAbsolute(value))
-    ? win32
-    : posix;
-  const absoluteHandler = path.isAbsolute(handler) ? handler : path.resolve(projectRoot, handler);
-  const extension = path.extname(absoluteHandler);
-  const pathWithoutExtension = routeFileExtensions.has(extension)
-    ? absoluteHandler.slice(0, -extension.length)
-    : absoluteHandler;
-  const importPath = toPosixPath(
-    path.relative(path.dirname(declarationFile), pathWithoutExtension),
-  );
-
-  return importPath.startsWith('.') ? importPath : `./${importPath}`;
-}
-
-function getBasePathname(baseURL: string): string {
-  const pathname = new URL(baseURL, 'http://pathstrider.local').pathname;
-  const normalized = `/${pathname}`.replace(/\/{2,}/g, '/').replace(/\/$/, '');
-
-  return normalized || '/';
-}
-
-function stripRoutePrefix(route: string, prefix: string): string {
-  if (prefix === '/') {
-    return route;
-  }
-
-  if (route === prefix) {
-    return '/';
-  }
-
-  return route.startsWith(`${prefix}/`) ? route.slice(prefix.length) : route;
-}
-
-function matchesAny(route: string, patterns: string[]): boolean {
-  return patterns.some(pattern => createPattern(pattern).test(route));
-}
-
-function createPattern(pattern: string): RegExp {
-  const segments = pattern.split('/');
-  let source = '';
-
-  for (const [index, segment] of segments.entries()) {
-    if (index === 0 && segment === '') {
-      continue;
-    }
-
-    if (segment === '**') {
-      source += '(?:/.*)?';
-      continue;
-    }
-
-    const value = segment === '*' ? '[^/]*' : segment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-    source += `/${value}`;
-  }
-
-  return new RegExp(`^${source}$`);
-}
-
-function normalizeMethod(method: string): UppercaseHTTPMethod {
-  const normalized = method.toUpperCase();
-  const isSupported = httpMethods.some(value => value.toUpperCase() === normalized);
-
-  if (!isSupported) {
-    throw new Error(`Unsupported HTTP method: ${method}.`);
-  }
-
-  return normalized as UppercaseHTTPMethod;
-}
-
-function quoteProperty(value: string): string {
-  return /^[A-Za-z_$][\w$]*$/.test(value) ? value : JSON.stringify(value);
-}
-
-function indent(depth: number): string {
-  return '  '.repeat(depth);
-}
-
-function toPosixPath(path: string): string {
-  return path.replaceAll('\\', '/');
 }

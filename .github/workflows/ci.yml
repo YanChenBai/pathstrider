@@ -28,5 +28,8 @@ jobs:
       - name: Format, lint and typecheck
         run: vp run check
 
+      - name: Pack
+        run: vp pack
+
       - name: Test
         run: vp run test

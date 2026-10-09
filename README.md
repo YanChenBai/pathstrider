@@ -1,308 +1,93 @@
-<div align="center">
-
 # Pathstrider
 
-### Walk through Nitro routes with end-to-end types.
+Validated Nitro routes, automatic OpenAPI schemas, and typed ofetch clients. A Vite plugin built on Vite's OXC parser and fetchdts.
 
-Pathstrider reads the routes Nitro actually resolved, turns them into an Eden-style client, and
-keeps request, response, and error types connected without a second route contract.
+## Install
 
-[![npm](https://img.shields.io/npm/v/pathstrider?color=CB3837&label=npm)](https://www.npmjs.com/package/pathstrider)
-[![license](https://img.shields.io/github/license/YanChenBai/pathstrider)](https://github.com/YanChenBai/pathstrider/blob/main/LICENSE)
-[![stars](https://img.shields.io/github/stars/YanChenBai/pathstrider?style=flat)](https://github.com/YanChenBai/pathstrider/stargazers)
-
-[Quick Start](#quick-start) · [Typed Routes](#a-typed-route) · [Error Model](#one-error-shape) ·
-[Client](#the-client) · [GitHub](https://github.com/YanChenBai/pathstrider)
-
-> Inspired by Elysia and Eden Treaty. Built for Nitro and Ky.
-
-</div>
-
-> [!NOTE]
-> Pathstrider is in early development. Its core contract is intentionally small while the runtime
-> and type behavior settle.
-
-## Why Pathstrider?
-
-Nitro already knows where your routes are. Your handlers already know their request and response
-types. Pathstrider connects those facts instead of asking you to describe the API again.
-
-- Follows Nitro's resolved routes, including configured and programmatic routes.
-- Generates a tree-shaped client with static, dynamic, and catch-all paths.
-- Accepts every [Standard Schema](https://standardschema.dev/) implementation.
-- Uses a fixed error shape across the server, Nitro fallback, and client.
-- Exposes Ky's request options and hooks directly through `useClient`.
-- Emits JavaScript and declaration sourcemaps.
-
-## Quick Start
-
-Install Pathstrider in an existing Nitro project. This example uses Zod, but any Standard Schema
-implementation works:
-
-```bash
+```sh
 pnpm add pathstrider zod
 ```
 
-Register the plugin after Nitro:
+Requires Vite 8.3+ and Nitro 3. Pathstrider imports `parseSync` and `Visitor` directly from `vite`; applications do not need Vite+ or a separate OXC parser.
+
+## Vite plugin
 
 ```ts
-// vite.config.ts
-import { pathstrider } from 'pathstrider/vite';
 import { nitro } from 'nitro/vite';
 import { defineConfig } from 'vite';
+import { pathstrider } from 'pathstrider/vite';
 
 export default defineConfig({
   plugins: [
-    nitro(),
-    pathstrider({
-      output: {
-        types: './pathstrider.d.ts',
-      },
-      scan: {
-        include: ['/api/**'],
-        exclude: ['/api/internal/**'],
-      },
-      validation: {
-        response: true,
-      },
-    }),
+    nitro({ experimental: { openAPI: true } }),
+    pathstrider({ dts: './.types/pathstrider.d.ts' }),
   ],
 });
 ```
 
-The default declaration output is `pathstrider.d.ts`. Keep it inside the TypeScript project's
-`include` scope.
+`dts` defaults to `pathstrider.d.ts`. Set `dts: false` to disable route declarations while keeping OpenAPI generation. Include the generated declaration in your application's tsconfig and start Vite or build before checking client types.
 
-`scan` only filters routes already resolved by Nitro. It supports `include`, `exclude`, and
-uppercase HTTP `methods`; it does not maintain an independent source directory.
+The plugin follows Nitro's resolved routing table, including configured routes. Static, dynamic, wildcard, and method-specific routes are compiled with fetchdts. Paths remain absolute, including `/api`; no implicit prefix is stripped.
 
-## A Typed Route
-
-`defineTypedHandler` accepts Standard Schema definitions for request input and responses:
+## Route
 
 ```ts
-// server/api/users/[id].get.ts
+import { defineValidatedHandler } from 'pathstrider';
 import { z } from 'zod';
 
-import { defineTypedHandler } from 'pathstrider';
-
-const UserSchema = z.object({
-  id: z.string(),
-  name: z.string(),
-});
-
-const UserNotFoundSchema = z.object({
-  code: z.literal('USER_NOT_FOUND'),
-  message: z.string(),
-  details: z.object({
-    userId: z.string(),
-  }),
-});
-
-export default defineTypedHandler(
-  async ({ params, status }) => {
-    const user = await findUser(params.id);
-
-    if (!user) {
-      return status(404, {
-        code: 'USER_NOT_FOUND',
-        message: 'User does not exist',
-        details: {
-          userId: params.id,
-        },
-      });
-    }
-
-    return user;
+export default defineValidatedHandler({
+  validate: {
+    query: z.object({ name: z.string().describe('User name') }),
   },
-  {
-    params: z.object({
-      id: z.string(),
-    }),
-    response: {
-      200: UserSchema,
-      404: UserNotFoundSchema,
-    },
+  responses: {
+    200: z.object({ name: z.string() }).describe('Successful greeting'),
   },
-);
-```
-
-A single response schema is shorthand for status 200:
-
-```ts
-defineTypedHandler(handler, {
-  response: UserSchema,
+  openAPI: {
+    tags: ['greeting'],
+    description: 'Returns a greeting message',
+  },
+  handler: ({ query }, event) => ({ name: query.name }),
 });
 ```
 
-Equivalent form:
+Request validation supports `query`, `headers`, and JSON `body`. The first handler argument contains the schemas' parsed outputs; the second is the H3 event. Async validation, defaults and transforms are supported. Invalid requests return HTTP 400. Customize this through `validate.onError`.
+
+`responses` maps status codes directly to schemas. The schema's top-level description becomes the OpenAPI response description. `openAPI` supplies operation metadata and parameter overrides; it does not accept `responses`. Response schemas describe documentation and client types; they do not validate or transform returned values at runtime.
+
+Runtime validation accepts Standard Schema implementations. OpenAPI conversion uses Standard JSON Schema's `~standard.jsonSchema.input/output` with the `openapi-3.0` target. Choose a schema library that implements both standards; Zod is only used in the example. Missing or unsupported conversions fail the build. Request JSON schemas use the input representation, response JSON schemas use the output representation.
+
+The build macro supports a default exported `defineValidatedHandler(...)` call, named import aliases, inline schemas, local const declarations, and imported schemas. Top-level option spreads and computed keys are rejected. Business handler code and unrelated route-level statements are excluded from schema evaluation. Imported schema modules should have no business side effects.
+
+OpenAPI is available at `/_openapi.json` during development. Production availability is controlled by Nitro's `openAPI.production` setting.
+
+## Client
 
 ```ts
-defineTypedHandler(handler, {
-  response: {
-    200: UserSchema,
-  },
+import { apiFetch, createRouteFetch } from 'pathstrider/client';
+
+const greeting = await apiFetch('/api/greeting', {
+  query: { name: 'Codex' },
 });
+greeting.name; // string
+
+const api = createRouteFetch({ baseURL: 'https://example.com' });
 ```
 
-Response schemas provide client inference. Runtime response validation is disabled by default;
-enable it globally with `validation.response`. When enabled, successful response schemas can also
-transform their values. Non-success response schemas currently provide input and client inference
-only, while Pathstrider always verifies their common error shape at runtime.
+The generated declarations augment the client's `Routes` interface. Routes, HTTP methods, required query/body/headers, and successful responses are inferred. Request types use schema inputs; response types use the union of declared 2xx schema outputs. Ordinary Nitro handlers remain callable with unknown response types.
 
-## One Error Shape
+This is an ofetch client: failed HTTP responses throw ofetch's `FetchError`, and declared bodies are sent as JSON. Route calls use JSON response mode. Use ofetch directly for other response formats or arbitrary URLs.
 
-Every response error uses the same wire structure:
+## Breaking migration
 
-```ts
-type PathstriderError<Code extends string = string, Details = never> = {
-  code: Code;
-  message: string;
-} & ([Details] extends [never] ? {} : { details: Details });
-```
-
-Request validation failures become:
-
-```json
-{
-  "code": "VALIDATION_ERROR",
-  "message": "Request validation failed",
-  "details": {
-    "target": "query",
-    "issues": []
-  }
-}
-```
-
-Unhandled failures become a safe `INTERNAL_SERVER_ERROR`. Pathstrider also installs a Nitro error
-handler before Nitro's built-in fallback, so errors outside a typed handler retain the same JSON
-shape without replacing user-configured Nitro error handlers.
-
-## The Client
-
-`useClient` is bound to the generated application route types by default:
-
-```ts
-import { useClient } from 'pathstrider/client';
-
-const api = useClient();
-
-const result = await api.users({ id: 'user-1' }).get();
-
-if (!result.error) {
-  console.log(result.data.name);
-}
-```
-
-HTTP errors throw by default, after Pathstrider has parsed the response:
-
-```ts
-import { type Client, isClientHTTPError, useClient } from 'pathstrider/client';
-
-const api = useClient();
-
-const user = api.users({ id: 'missing' });
-type GetUserError = Client.Error<typeof user.get>;
-
-try {
-  await user.get();
-} catch (error) {
-  if (isClientHTTPError<GetUserError>(error) && error.status === 404) {
-    console.error(error.value.code, error.value.details.userId);
-  }
-}
-```
-
-Disable throwing to use an Eden-style result instead:
-
-```ts
-import { useClient } from 'pathstrider/client';
-
-const api = useClient({
-  baseUrl: 'https://example.com/api/',
-  throwHttpErrors: false,
-});
-
-const { data, error } = await api.users({ id: 'user-1' }).get();
-
-if (error) {
-  console.error(error.status, error.value);
-} else {
-  console.log(data.name);
-}
-```
-
-## Ky, Built In
-
-`useClient` accepts Ky options directly. Authentication, retries, timeouts, request mutation, and
-other transport behavior use the same names and hooks as Ky:
-
-```ts
-import { useClient } from 'pathstrider/client';
-
-const api = useClient({
-  baseUrl: '/api/',
-  headers: {
-    'x-client': 'web',
-  },
-  hooks: {
-    beforeRequest: [
-      ({ request }) => {
-        request.headers.set('authorization', readAccessToken());
-      },
-    ],
-  },
-  retry: 2,
-  timeout: 15_000,
-});
-```
-
-Pathstrider's normalized lifecycle observers live under `pathstriderHooks`, leaving Ky's `hooks`
-untouched:
-
-```ts
-const api = useClient({
-  pathstriderHooks: {
-    onResponseError({ error }) {
-      reportError(error.status, error.value.code);
-    },
-    onRequestError({ error }) {
-      reportNetworkFailure(error);
-    },
-  },
-});
-```
-
-Response hooks are observers and do not silently replace inferred route errors.
-
-## How It Works
-
-```mermaid
-flowchart LR
-  Nitro[Nitro resolved routes] --> Types[Generated route tree]
-  Handler[defineTypedHandler] --> Contract[Request, response and error types]
-  Contract --> Types
-  Types --> Client[useClient route proxy]
-  Client --> Ky[Ky request pipeline]
-  Ky --> Server[Nitro server]
-  Server --> Fallback[Pathstrider error fallback]
-```
-
-No separate route scanner is involved. Nitro remains the source of truth for routing, while the
-handler remains the source of truth for request and response behavior.
+The former `defineTypedHandler`, `status`, Ky `useClient`, tree-shaped routes and custom error-handler exports have been removed. Use `defineValidatedHandler({ validate, responses, openAPI, handler })`, `apiFetch('/path', options)` and the Vite plugin's `dts` option. Regenerate route declarations rather than editing old generated files.
 
 ## Development
 
-```bash
+```sh
 vp install
+vp pack
 vp check
-vp test --run
-vp run build
+vp test run
 ```
 
-## Acknowledgements
-
-Pathstrider's route tree and error narrowing are inspired by
-[Elysia](https://elysiajs.com/) and [Eden Treaty](https://elysiajs.com/eden/treaty/overview).
-Its transport layer is powered by [Ky](https://github.com/sindresorhus/ky), and route discovery is
-owned by [Nitro](https://nitro.build/).
+Development checks use Vite+; the published plugin imports standard Vite. `vp pack` reads the package build settings from `vite.config.ts` and emits JavaScript and declaration sourcemaps. The macro also returns a sourcemap with the original route source embedded.
